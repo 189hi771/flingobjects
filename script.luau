@@ -2,224 +2,361 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 local Players = game:GetService("Players")
+local Debris = game:GetService("Debris")
 
 local plr = Players.LocalPlayer
 local mouse = plr:GetMouse()
 local cam = Workspace.CurrentCamera
 
 local char = plr.Character or plr.CharacterAdded:Wait()
--- force first person mode
+-- forcing first person cause it looks better for this
 plr.CameraMode = Enum.CameraMode.LockFirstPerson
 
-local settings = {
-	range = 60,
-	throw_power = 300, 
-	smoothness = 0.2, 
-	color_idle = Color3.fromRGB(255, 255, 255),
-	color_active = Color3.fromRGB(85, 255, 127)
+-- bunch of settings
+local config = {
+	reach = 65, -- max distance
+	min_dist = 5, -- cant pull closer than this
+	-- throw settings
+	base_throw_power = 100,
+	max_throw_power = 800,
+	charge_rate = 15, -- how fast throw power goes up
+	-- movement feel
+	lerp_speed = 0.25, -- lower = laggy/heavy feel
+	rotation_speed = 2.5, -- how fast R and T spin it
+	-- wobble effect (makes it look unstable)
+	wobble_amount = 0.05,
+	wobble_speed = 10,
+
+	-- color
+	col_norm = Color3.fromRGB(255, 255, 255),
+	col_grab = Color3.fromRGB(0, 255, 100),
+	col_charge = Color3.fromRGB(255, 50, 50)
 }
 
-local Controller = {}
-Controller.__index = Controller
+-- global variables
+local holding = false
+local target_part = nil
+local current_dist = 15
+local current_rot = CFrame.identity
+local grab_offset = CFrame.identity -- where we grabbed the part relative to center
 
-function Controller.new()
-	local self = setmetatable({}, Controller)
+-- charge mechanics
+local is_charging = false
+local current_charge = 0
 
-	self.IsActive = false
-	self.TargetPart = nil
-	self.Distance = 15
-	self.Rotation = CFrame.identity
+-- auto spin mode
+local auto_spin = false
+local spin_axis = 0
 
-	-- highlight box
-	self.Selection = Instance.new("SelectionBox")
-	self.Selection.LineThickness = 0.05
-	self.Selection.Parent = plr:WaitForChild("PlayerGui")
+-- selection box
+local highlight = Instance.new("SelectionBox")
+highlight.Name = "GrabHighlight"
+highlight.LineThickness = 0.05
+highlight.Parent = plr:WaitForChild("PlayerGui")
 
-	self:SetupInputs()
-	return self
+-- ignore list for rays
+local function get_ignored_stuff()
+	local ignore = {char}
+	-- add the current part if we holding one
+	if target_part then
+		table.insert(ignore, target_part)
+	end
+	return ignore
 end
 
-function Controller:CastRay()
-	local pos = UserInputService:GetMouseLocation()
-	local ray = cam:ViewportPointToRay(pos.X, pos.Y)
+-- the raycaster
+local function shoot_ray()
+	local mouse_pos = UserInputService:GetMouseLocation()
+	local ray = cam:ViewportPointToRay(mouse_pos.X, mouse_pos.Y)
 
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
-	local ignore = {plr.Character}
+	params.FilterDescendantsInstances = get_ignored_stuff()
 
-	-- ignore the part we holding so ray goes thru it
-	if self.TargetPart then table.insert(ignore, self.TargetPart) end
-	params.FilterDescendantsInstances = ignore
-
-	return Workspace:Raycast(ray.Origin, ray.Direction * settings.range, params)
+	-- do the raycast
+	local result = Workspace:Raycast(ray.Origin, ray.Direction * config.reach, params)
+	return result
 end
 
-function Controller:AttemptGrab()
-	if self.IsActive then return end
+-- logic to grab the thing
+local function attempt_grab()
+	if holding then return end -- already got something
 
-	local result = self:CastRay()
-	if result and result.Instance then
-		local originalPart = result.Instance
+	local res = shoot_ray()
 
-		if originalPart.Locked then return end
+	if res and res.Instance then
+		local hit_part = res.Instance
 
-		-- we delete server part locally and make a clone we own
-		-- so physics actually works
+		if hit_part.Locked then return end -- cant touch locked stuff
+		if hit_part:IsA("Terrain") then return end -- dont grab the floor
 
-		local myPart = originalPart:Clone()
-		myPart.Parent = Workspace
-		myPart.CFrame = originalPart.CFrame 
+		local clone = hit_part:Clone()
+		clone.Parent = Workspace
+		clone.CFrame = hit_part.CFrame
+		clone.Name = "ClonedPhysicsPart"
 
-		-- destroy old one (locally)
-		originalPart:Destroy() 
+		-- delete the original
+		hit_part:Destroy()
 
-		self.IsActive = true
-		self.TargetPart = myPart 
+		-- setup the clone
+		clone.Anchored = true
+		clone.CanCollide = false
+		clone.Massless = true
+		clone.CastShadow = false -- unnecessary lag fix
 
-		-- fix highlight here :
-		-- update the box to look at the NEW part
-		self.Selection.Adornee = myPart
+		-- clear velocity
+		clone.AssemblyLinearVelocity = Vector3.zero
+		clone.AssemblyAngularVelocity = Vector3.zero
 
-		-- setup physics
-		myPart.Anchored = true 
-		myPart.CanCollide = false 
-		myPart.Massless = true 
-		myPart.AssemblyLinearVelocity = Vector3.new()
-		myPart.AssemblyAngularVelocity = Vector3.new()
+		-- save state
+		holding = true
+		target_part = clone
+		current_dist = (cam.CFrame.Position - clone.Position).Magnitude
+		current_rot = clone.CFrame.Rotation
 
-		self.Distance = (cam.CFrame.Position - myPart.Position).Magnitude
-		self.Rotation = myPart.CFrame.Rotation
+		-- calculate offset so part doesnt snap to center
+		-- this makes it so if u grab the corner, u hold the corner
+		grab_offset = CFrame.lookAt(cam.CFrame.Position, clone.Position):Inverse() * clone.CFrame
+
+		-- update visuals
+		highlight.Adornee = clone
+		print("grabbed " .. clone.Name)
 	end
 end
 
-function Controller:Release(throw)
-	if not self.IsActive then return end
+-- drop or throw logic
+local function release_object(do_throw)
+	if not holding or not target_part then return end
 
-	local p = self.TargetPart
+	local p = target_part
 
-	if p then
-		p.CanCollide = true
-		p.Massless = false
-		p.Anchored = false -- unanchor clone
+	-- reset properties
+	p.CanCollide = true
+	p.Massless = false
+	p.CastShadow = true
 
-		if throw then
-			task.spawn(function()
-				RunService.Heartbeat:Wait()
-				if not p then return end
+	-- the unanchor
+	p.Anchored = false
 
+	if do_throw then
+		-- delay needed for physics engine wake up
+		task.spawn(function()
+			RunService.Heartbeat:Wait()
+
+			if p and p.Parent then
 				local dir = cam.CFrame.LookVector
-				p.AssemblyLinearVelocity = dir * settings.throw_power
-				p.AssemblyAngularVelocity = Vector3.new(math.random(-20,20), math.random(-20,20), math.random(-20,20))
-			end)
+
+				-- calculate total power
+				local final_power = config.base_throw_power + current_charge
+
+				-- yeet
+				p.AssemblyLinearVelocity = dir * final_power
+
+				-- add spin based on power
+				local rot_power = final_power / 20
+				p.AssemblyAngularVelocity = Vector3.new(
+					math.random(-rot_power, rot_power),
+					math.random(-rot_power, rot_power),
+					math.random(-rot_power, rot_power)
+				)
+			end
+		end)
+	else
+		-- drop logic
+		-- kill momentum so it falls straight
+		p.AssemblyLinearVelocity = Vector3.zero
+		p.AssemblyAngularVelocity = Vector3.zero
+	end
+
+	-- reset all variables
+	holding = false
+	target_part = nil
+	highlight.Adornee = nil
+	is_charging = false
+	current_charge = 0
+	auto_spin = false
+end
+
+-- input management
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+
+	-- left click
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		attempt_grab()
+
+		-- F key (charge / throw)
+	elseif input.KeyCode == Enum.KeyCode.F then
+		if holding then
+			is_charging = true
+		end
+
+		-- R key (rotate Y)
+	elseif input.KeyCode == Enum.KeyCode.R then
+		if holding then
+			local r = CFrame.Angles(0, math.rad(45), 0)
+			current_rot = current_rot * r
+		end
+
+		-- T key (rotate X)
+	elseif input.KeyCode == Enum.KeyCode.T then
+		if holding then
+			local r = CFrame.Angles(math.rad(45), 0, 0)
+			current_rot = current_rot * r
+		end
+
+		-- Q key (toggle auto spin)
+	elseif input.KeyCode == Enum.KeyCode.Q then
+		if holding then
+			auto_spin = not auto_spin
+		end
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	-- release click = drop
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		release_object(false)
+
+		-- release F = throw
+	elseif input.KeyCode == Enum.KeyCode.F then
+		if holding and is_charging then
+			release_object(true)
+		end
+		is_charging = false
+	end
+end)
+
+-- mouse wheel
+UserInputService.InputChanged:Connect(function(input, gp)
+	if not gp and input.UserInputType == Enum.UserInputType.MouseWheel then
+		if holding then
+			local delta = input.Position.Z
+			current_dist = current_dist - (delta * 2)
+
+			-- clamp check
+			if current_dist < config.min_dist then 
+				current_dist = config.min_dist 
+			end
+			if current_dist > config.reach then 
+				current_dist = config.reach 
+			end
+		end
+	end
+end)
+
+-- MAIN LOOP
+-- this runs every single frame
+RunService.RenderStepped:Connect(function(dt)
+
+	-- 1. IF NOT HOLDING
+	if not holding then
+		local r = shoot_ray()
+
+		if r and r.Instance then
+			-- check if we can grab it
+			if not r.Instance.Locked and not r.Instance.Anchored then
+				highlight.Adornee = r.Instance
+				highlight.Color3 = config.col_norm
+				mouse.Icon = "rbxasset://textures/Cursors/Gamepad/Pointer.png"
+			else
+				highlight.Adornee = nil
+				mouse.Icon = "rbxasset://textures/Cursors/KeyboardMouse/ArrowCursor.png"
+			end
 		else
-			p.AssemblyLinearVelocity = Vector3.new(0,0,0)
-			p.AssemblyAngularVelocity = Vector3.new(0,0,0)
-		end
-	end
-
-	self.IsActive = false
-	self.TargetPart = nil
-
-	-- clear highlight
-	self.Selection.Adornee = nil
-end
-
-function Controller:SetupInputs()
-	UserInputService.InputBegan:Connect(function(input, gp)
-		if gp then return end
-
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			self:AttemptGrab()
-		elseif input.KeyCode == Enum.KeyCode.F then
-			self:Release(true) 
-		elseif input.KeyCode == Enum.KeyCode.R then
-			self:Rotate("Y")
-		elseif input.KeyCode == Enum.KeyCode.T then
-			self:Rotate("X")
-		end
-	end)
-
-	UserInputService.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			self:Release(false) 
-		end
-	end)
-
-	UserInputService.InputChanged:Connect(function(input, gp)
-		if not gp and input.UserInputType == Enum.UserInputType.MouseWheel then
-			self:Scroll(input.Position.Z)
-		end
-	end)
-end
-
-function Controller:Scroll(delta)
-	if self.IsActive then
-		self.Distance = math.clamp(self.Distance - (delta * 2), 5, settings.range)
-	end
-end
-
-function Controller:Rotate(axis)
-	if self.IsActive then
-		local rot = CFrame.identity
-		if axis == "X" then rot = CFrame.Angles(math.rad(45), 0, 0) end
-		if axis == "Y" then rot = CFrame.Angles(0, math.rad(45), 0) end
-		self.Rotation = self.Rotation * rot
-	end
-end
-
-function Controller:Step(dt)
-	-- idle state ( not holding )
-	if not self.IsActive then
-		local res = self:CastRay()
-		if res and res.Instance then
-			self.Selection.Adornee = res.Instance
-			self.Selection.Color3 = settings.color_idle
-			mouse.Icon = "rbxasset://textures/Cursors/Gamepad/Pointer.png"
-		else
-			-- if looking at sky, turn off highlight
-			self.Selection.Adornee = nil
+			highlight.Adornee = nil
 			mouse.Icon = "rbxasset://textures/Cursors/KeyboardMouse/ArrowCursor.png"
 		end
 		return
 	end
 
-	-- holding state
-	if not self.TargetPart or not self.TargetPart.Parent then
-		self:Release(false)
+	-- safety check
+	if not target_part or not target_part.Parent then
+		-- part got deleted or fell into void
+		holding = false
+		target_part = nil
+		highlight.Adornee = nil
 		return
 	end
 
-	-- force highlight to stay on the grabbed part
-	self.Selection.Adornee = self.TargetPart
-	self.Selection.Color3 = settings.color_active
+	-- charge logic
+	if is_charging then
+		-- ramp up power
+		current_charge = current_charge + config.charge_rate
+		if current_charge > config.max_throw_power then
+			current_charge = config.max_throw_power
+		end
 
+		-- make box red
+		highlight.Color3 = config.col_charge
+
+		-- shake cam a bit for effect
+		local shake = Vector3.new(math.random()-0.5, math.random()-0.5, 0) * 0.05
+		cam.CFrame = cam.CFrame * CFrame.new(shake)
+	else
+		highlight.Color3 = config.col_grab
+	end
+
+	-- auto spin 
+	if auto_spin then
+		spin_axis = spin_axis + (dt * 5)
+		local spin_rot = CFrame.Angles(0, spin_axis, 0)
+		-- mix it with current rotation
+		current_rot = current_rot * CFrame.Angles(0, dt, 0)
+	end
+
+	-- pos calculation
 	local cf = cam.CFrame
-	local goal_pos = cf.Position + (cf.LookVector * self.Distance)
 
-	local ray_origin = cf.Position
-	local ray_dir = (goal_pos - ray_origin)
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = {plr.Character, self.TargetPart} 
-	local hit_result = Workspace:Raycast(ray_origin, ray_dir, params)
+	-- where we want the part to be
+	local target_pos = cf.Position + (cf.LookVector * current_dist)
 
-	if hit_result then goal_pos = hit_result.Position end
+	-- wall collision checks
+	-- shoot ray from face to target pos
+	local wall_ray_origin = cf.Position
+	local wall_ray_dir = (target_pos - wall_ray_origin)
 
-	local look_rot = CFrame.lookAt(Vector3.zero, cf.LookVector)
-	local goal_cframe = CFrame.new(goal_pos) * look_rot * self.Rotation
+	local wall_params = RaycastParams.new()
+	wall_params.FilterType = Enum.RaycastFilterType.Exclude
+	wall_params.FilterDescendantsInstances = {char, target_part}
 
-	self.TargetPart.CFrame = self.TargetPart.CFrame:Lerp(goal_cframe, settings.smoothness)
-	self.TargetPart.AssemblyLinearVelocity = Vector3.new()
-end
+	local wall_hit = Workspace:Raycast(wall_ray_origin, wall_ray_dir, wall_params)
 
--- initalize
-local main = Controller.new()
+	if wall_hit then
+		-- if hit wall, pull part closer
+		target_pos = wall_hit.Position
+	end
 
-RunService.RenderStepped:Connect(function(dt)
-	main:Step(dt)
+	-- wobble calculation
+	-- adds noise to position so it doesnt look frozen
+	local time_now = tick()
+	local noise_x = math.sin(time_now * config.wobble_speed) * config.wobble_amount
+	local noise_y = math.cos(time_now * config.wobble_speed) * config.wobble_amount
+	local wobble_vec = Vector3.new(noise_x, noise_y, 0)
+
+	-- apply wobble only if heavy/far (optional detail)
+	target_pos = target_pos + wobble_vec
+
+	-- final cframe
+	local look_rotation = CFrame.lookAt(Vector3.zero, cf.LookVector)
+
+	-- combine everything
+	local goal_cframe = CFrame.new(target_pos) * look_rotation * current_rot
+
+	-- part movement
+	-- lerp for smooth movement
+	target_part.CFrame = target_part.CFrame:Lerp(goal_cframe, config.lerp_speed)
+
+	-- reset physics
+	-- keep velocity zero so it doesnt fly away while holding
+	target_part.AssemblyLinearVelocity = Vector3.zero
+	target_part.AssemblyAngularVelocity = Vector3.zero
 end)
 
--- release object when player resets or leaves
+-- cleanup when dying
 plr.CharacterRemoving:Connect(function()
-	main:Release(false)
+	if holding then
+		release_object(false)
+	end
+	highlight:Destroy()
 end)
